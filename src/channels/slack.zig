@@ -29,6 +29,7 @@ pub const SlackChannel = struct {
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
+    thread_policy: root.GroupPolicy = .mention_only,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -125,6 +126,7 @@ pub const SlackChannel = struct {
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         ch.reply_to_mode = cfg.reply_to_mode;
+        ch.thread_policy = parseGroupPolicy(cfg.thread_policy);
         return ch;
     }
 
@@ -165,6 +167,15 @@ pub const SlackChannel = struct {
     pub fn shouldHandle(self: *const SlackChannel, sender_id: []const u8, is_dm: bool, message_text: []const u8, bot_user_id: ?[]const u8) bool {
         const is_mention = if (bot_user_id) |bid| containsMention(message_text, bid) else false;
         return root.checkPolicy(self.policy, sender_id, is_dm, is_mention);
+    }
+
+    /// Like shouldHandle but for thread replies, applying thread_policy instead of group policy.
+    /// When thread_policy is .open, the mention requirement is waived while allowlist still applies.
+    fn shouldHandleForThread(self: *const SlackChannel, sender_id: []const u8, message_text: []const u8) bool {
+        return switch (self.thread_policy) {
+            .open => root.checkPolicy(self.policy, sender_id, false, true),
+            else => self.shouldHandle(sender_id, false, message_text, self.bot_user_id),
+        };
     }
 
     pub fn healthCheck(self: *SlackChannel) bool {
@@ -454,16 +465,21 @@ pub const SlackChannel = struct {
             else => null,
         } else null;
 
-        const is_dm = isDirectConversationId(channel_id);
-        if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
-
-        // Determine effective thread_ts for the reply target.
         // A message with thread_ts == ts is a top-level post that merely started a
         // thread; only thread_ts != ts means it is an actual thread reply.
         const is_thread_reply = if (thread_ts) |tts|
             if (message_ts) |mts| !std.mem.eql(u8, tts, mts) else true
         else
             false;
+
+        const is_dm = isDirectConversationId(channel_id);
+        const handle = if (!is_dm and is_thread_reply)
+            self.shouldHandleForThread(sender_id, text)
+        else
+            self.shouldHandle(sender_id, is_dm, text, self.bot_user_id);
+        if (!handle) return;
+
+        // Determine effective thread_ts for the reply target.
         const effective_thread_ts: ?[]const u8 = switch (self.reply_to_mode) {
             .off => if (is_thread_reply) thread_ts else null,
             .all => thread_ts orelse message_ts,
@@ -1715,6 +1731,80 @@ test "processHistoryMessage all mode with thread_ts uses thread_ts" {
     var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("C99:1700000001.000", msg.chat_id);
+}
+
+test "thread_policy open: thread reply without mention is handled" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.thread_policy = .open;
+    ch.setBus(&eb);
+
+    // No mention in text, but it's a thread reply (thread_ts != ts)
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"follow up without mention","ts":"1700000002.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("follow up without mention", msg.content);
+}
+
+test "thread_policy mention_only: thread reply without mention is dropped" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.bot_user_id = try alloc.dupe(u8, "UBOT");
+    defer alloc.free(ch.bot_user_id.?);
+    ch.policy.group = .mention_only;
+    ch.thread_policy = .mention_only;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"follow up without mention","ts":"1700000002.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    // Close the bus so consumeInbound returns null instead of blocking
+    eb.close();
+    try std.testing.expect(eb.consumeInbound() == null);
+}
+
+test "thread_policy open: top-level message without mention is still dropped" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.bot_user_id = try alloc.dupe(u8, "UBOT");
+    defer alloc.free(ch.bot_user_id.?);
+    ch.policy.group = .mention_only;
+    ch.thread_policy = .open;
+    ch.setBus(&eb);
+
+    // Top-level message (no thread_ts) without mention — thread_policy should not apply
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"no mention top level","ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    eb.close();
+    try std.testing.expect(eb.consumeInbound() == null);
 }
 
 test "mrkdwn bold conversion" {

@@ -311,6 +311,7 @@ pub const SlackConfig = struct {
     allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
+    thread_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
 };
 
