@@ -313,6 +313,7 @@ pub const SlackConfig = struct {
     group_policy: []const u8 = "mention_only",
     thread_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+    thread_initial_history_limit: u16 = 20,
 };
 
 pub const WebhookConfig = struct {

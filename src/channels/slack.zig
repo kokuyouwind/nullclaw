@@ -30,6 +30,8 @@ pub const SlackChannel = struct {
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
     thread_policy: root.GroupPolicy = .mention_only,
+    thread_initial_history_limit: u16 = 20,
+    seen_thread_sessions: std.StringHashMapUnmanaged(void) = .empty,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -127,6 +129,7 @@ pub const SlackChannel = struct {
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         ch.reply_to_mode = cfg.reply_to_mode;
         ch.thread_policy = parseGroupPolicy(cfg.thread_policy);
+        ch.thread_initial_history_limit = cfg.thread_initial_history_limit;
         return ch;
     }
 
@@ -176,6 +179,99 @@ pub const SlackChannel = struct {
             .open => root.checkPolicy(self.policy, sender_id, false, true),
             else => self.shouldHandle(sender_id, false, message_text, self.bot_user_id),
         };
+    }
+
+    /// Check if thread history should be fetched (new thread session only) and return it.
+    fn maybeGetThreadHistory(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8, current_ts: ?[]const u8) ?[]const u8 {
+        if (self.thread_initial_history_limit == 0) return null;
+
+        // Check if this thread has already been seen; if so, skip fetching.
+        const gop = self.seen_thread_sessions.getOrPut(self.allocator, thread_ts) catch return null;
+        if (gop.found_existing) return null;
+
+        // Store an owned copy of thread_ts as key (the original is transient JSON data).
+        gop.key_ptr.* = self.allocator.dupe(u8, thread_ts) catch {
+            // Remove the entry if we can't allocate the key copy.
+            self.seen_thread_sessions.removeByPtr(gop.key_ptr);
+            return null;
+        };
+
+        return self.fetchThreadReplies(channel_id, thread_ts, current_ts);
+    }
+
+    /// Fetch thread replies from Slack conversations.replies API.
+    /// Returns formatted thread history string, or null on error/empty.
+    fn fetchThreadReplies(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8, current_ts: ?[]const u8) ?[]const u8 {
+        if (builtin.is_test) return null;
+        if (self.thread_initial_history_limit == 0) return null;
+
+        var url_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&url_buf);
+        const w = fbs.writer();
+        w.print("{s}/conversations.replies?channel={s}&ts={s}&inclusive=true&limit=200", .{ API_BASE, channel_id, thread_ts }) catch return null;
+        const url = fbs.getWritten();
+
+        const auth_header = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return null;
+        defer self.allocator.free(auth_header);
+        const headers = [_][]const u8{auth_header};
+        const resp = root.http_util.curlGet(self.allocator, url, &headers, "30") catch return null;
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        ensureSlackApiOk(parsed.value.object, "conversations.replies", channel_id) catch return null;
+
+        const messages_val = parsed.value.object.get("messages") orelse return null;
+        if (messages_val != .array) return null;
+        const messages = messages_val.array.items;
+        if (messages.len == 0) return null;
+
+        // Collect up to thread_initial_history_limit most recent messages (excluding current).
+        const limit: usize = @intCast(self.thread_initial_history_limit);
+        var retained: std.ArrayListUnmanaged(struct { user: []const u8, text: []const u8 }) = .empty;
+        defer retained.deinit(self.allocator);
+
+        for (messages) |msg_val| {
+            if (msg_val != .object) continue;
+            const msg_obj = msg_val.object;
+            // Skip messages with subtypes (joins, leaves, etc.)
+            if (msg_obj.get("subtype")) |sub_val| {
+                if (sub_val == .string and sub_val.string.len > 0) continue;
+            }
+            const ts_val = msg_obj.get("ts") orelse continue;
+            if (ts_val != .string) continue;
+            // Exclude the current message
+            if (current_ts) |cts| {
+                if (std.mem.eql(u8, ts_val.string, cts)) continue;
+            }
+            const user_val = msg_obj.get("user") orelse continue;
+            if (user_val != .string) continue;
+            const text_val = msg_obj.get("text") orelse continue;
+            if (text_val != .string or text_val.string.len == 0) continue;
+
+            retained.append(self.allocator, .{ .user = user_val.string, .text = text_val.string }) catch continue;
+            // Keep only the most recent `limit` messages
+            if (retained.items.len > limit) {
+                _ = retained.orderedRemove(0);
+            }
+        }
+
+        if (retained.items.len == 0) return null;
+
+        // Format as "[Thread history - for context]\n<@USER>: text\n..."
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        const rw = result.writer(self.allocator);
+        rw.writeAll("[Thread history - for context]\n") catch {
+            result.deinit(self.allocator);
+            return null;
+        };
+        for (retained.items) |entry| {
+            rw.print("<@{s}>: {s}\n", .{ entry.user, entry.text }) catch continue;
+        }
+        rw.writeAll("\n") catch {};
+
+        return result.toOwnedSlice(self.allocator) catch null;
     }
 
     pub fn healthCheck(self: *SlackChannel) bool {
@@ -235,6 +331,15 @@ pub const SlackChannel = struct {
         }
         self.last_ts_by_channel.deinit(self.allocator);
         self.last_ts_by_channel = .empty;
+    }
+
+    fn clearSeenThreadSessions(self: *SlackChannel) void {
+        var it = self.seen_thread_sessions.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.seen_thread_sessions.deinit(self.allocator);
+        self.seen_thread_sessions = .empty;
     }
 
     fn parseTs(ts: []const u8) f64 {
@@ -518,12 +623,24 @@ pub const SlackChannel = struct {
         }
         try mw.writeByte('}');
 
+        // Fetch and prepend thread history for new thread sessions.
+        const thread_history = if (is_thread_reply and effective_thread_ts != null)
+            self.maybeGetThreadHistory(channel_id, thread_ts.?, message_ts)
+        else
+            null;
+        defer if (thread_history) |th| self.allocator.free(th);
+
+        const effective_content = if (thread_history) |th| blk: {
+            break :blk std.fmt.allocPrint(self.allocator, "{s}{s}", .{ th, text }) catch text;
+        } else text;
+        defer if (thread_history != null and effective_content.ptr != text.ptr) self.allocator.free(effective_content);
+
         const inbound = try bus_mod.makeInboundFull(
             self.allocator,
             "slack",
             sender_id,
             chat_id,
-            text,
+            effective_content,
             session_key,
             &.{},
             metadata.items,
@@ -1032,6 +1149,7 @@ pub const SlackChannel = struct {
             self.bot_api_app_id = null;
         }
         self.clearChannelCursors();
+        self.clearSeenThreadSessions();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
             self.last_ts = "0";
@@ -1612,6 +1730,7 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     var ch = SlackChannel.init(alloc, "tok", null, "C12345", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearSeenThreadSessions();
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -1720,6 +1839,7 @@ test "processHistoryMessage all mode with thread_ts uses thread_ts" {
     ch.account_id = "sl-main";
     ch.reply_to_mode = .all;
     ch.setBus(&eb);
+    defer ch.clearSeenThreadSessions();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000002.000","thread_ts":"1700000001.000"}
@@ -1743,6 +1863,7 @@ test "thread_policy open: thread reply without mention is handled" {
     ch.account_id = "sl-main";
     ch.thread_policy = .open;
     ch.setBus(&eb);
+    defer ch.clearSeenThreadSessions();
 
     // No mention in text, but it's a thread reply (thread_ts != ts)
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -1805,6 +1926,107 @@ test "thread_policy open: top-level message without mention is still dropped" {
 
     eb.close();
     try std.testing.expect(eb.consumeInbound() == null);
+}
+
+test "maybeGetThreadHistory returns null in tests (fetchThreadReplies is no-op)" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    defer ch.clearSeenThreadSessions();
+
+    // fetchThreadReplies returns null in tests, so maybeGetThreadHistory should too.
+    const result = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
+    try std.testing.expect(result == null);
+
+    // But the thread_ts should still be tracked in seen_thread_sessions.
+    try std.testing.expect(ch.seen_thread_sessions.count() == 1);
+}
+
+test "maybeGetThreadHistory skips already-seen threads" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    defer ch.clearSeenThreadSessions();
+
+    // First call: registers the thread.
+    _ = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
+    try std.testing.expect(ch.seen_thread_sessions.count() == 1);
+
+    // Second call with same thread_ts: should skip (already seen).
+    const result = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000003.000");
+    try std.testing.expect(result == null);
+    try std.testing.expect(ch.seen_thread_sessions.count() == 1);
+}
+
+test "maybeGetThreadHistory respects thread_initial_history_limit zero" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.thread_initial_history_limit = 0;
+    defer ch.clearSeenThreadSessions();
+
+    const result = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
+    try std.testing.expect(result == null);
+    // Should not track when disabled.
+    try std.testing.expect(ch.seen_thread_sessions.count() == 0);
+}
+
+test "clearSeenThreadSessions frees all keys" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+
+    _ = ch.maybeGetThreadHistory("C99", "1700000001.000", null);
+    _ = ch.maybeGetThreadHistory("C99", "1700000002.000", null);
+    try std.testing.expect(ch.seen_thread_sessions.count() == 2);
+
+    ch.clearSeenThreadSessions();
+    try std.testing.expect(ch.seen_thread_sessions.count() == 0);
+}
+
+test "thread_initial_history_limit config default is 20" {
+    const cfg = config_types.SlackConfig{
+        .account_id = "main",
+        .mode = .socket,
+        .bot_token = "xoxb-test",
+    };
+    const ch = SlackChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqual(@as(u16, 20), ch.thread_initial_history_limit);
+}
+
+test "thread_initial_history_limit config is read from SlackConfig" {
+    const cfg = config_types.SlackConfig{
+        .account_id = "main",
+        .mode = .socket,
+        .bot_token = "xoxb-test",
+        .thread_initial_history_limit = 5,
+    };
+    const ch = SlackChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqual(@as(u16, 5), ch.thread_initial_history_limit);
+}
+
+test "processHistoryMessage thread reply content unchanged when history limit is 0" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.thread_initial_history_limit = 0;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hello","ts":"1700000002.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    // With limit=0, no history prepended; content should be original text.
+    try std.testing.expectEqualStrings("hello", msg.content);
 }
 
 test "mrkdwn bold conversion" {
