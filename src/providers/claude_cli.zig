@@ -106,6 +106,7 @@ pub const ClaudeCliProvider = struct {
             "--model",
             model,
             "--verbose",
+            "--dangerously-skip-permissions",
         };
 
         var child = std.process.Child.init(&argv, allocator);
