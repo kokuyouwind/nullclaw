@@ -32,6 +32,10 @@ pub const SlackChannel = struct {
     thread_policy: root.GroupPolicy = .mention_only,
     thread_initial_history_limit: u16 = 20,
     seen_thread_sessions: std.StringHashMapUnmanaged(void) = .empty,
+    /// Dedup: track recently processed message_ts to avoid handling both
+    /// `message` and `app_mention` events for the same Slack message.
+    last_processed_ts: ?[]const u8 = null,
+    last_processed_ts_owned: bool = false,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -548,6 +552,21 @@ pub const SlackChannel = struct {
     ) !void {
         if (msg_obj.get("subtype")) |sub_val| {
             if (sub_val == .string and sub_val.string.len > 0) return;
+        }
+
+        // Dedup: skip if we already processed this message_ts (e.g. both
+        // `message` and `app_mention` events fired for the same message).
+        if (msg_obj.get("ts")) |ts_val| {
+            if (ts_val == .string and ts_val.string.len > 0) {
+                if (self.last_processed_ts) |prev| {
+                    if (std.mem.eql(u8, prev, ts_val.string)) return;
+                }
+                if (self.last_processed_ts_owned) {
+                    if (self.last_processed_ts) |prev| self.allocator.free(prev);
+                }
+                self.last_processed_ts = self.allocator.dupe(u8, ts_val.string) catch null;
+                self.last_processed_ts_owned = self.last_processed_ts != null;
+            }
         }
 
         const user_val = msg_obj.get("user") orelse return;
@@ -1150,11 +1169,20 @@ pub const SlackChannel = struct {
         }
         self.clearChannelCursors();
         self.clearSeenThreadSessions();
+        self.clearLastProcessedTs();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
             self.last_ts = "0";
             self.last_ts_owned = false;
         }
+    }
+
+    fn clearLastProcessedTs(self: *SlackChannel) void {
+        if (self.last_processed_ts_owned) {
+            if (self.last_processed_ts) |ts| self.allocator.free(ts);
+        }
+        self.last_processed_ts = null;
+        self.last_processed_ts_owned = false;
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -1731,6 +1759,7 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     ch.account_id = "sl-main";
     ch.setBus(&eb);
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -1769,6 +1798,7 @@ test "processHistoryMessage off mode top-level post uses channel_id as chat_id" 
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
     // reply_to_mode defaults to .off
 
     // thread_ts == ts: top-level post that started a thread, not a reply
@@ -1793,6 +1823,7 @@ test "processHistoryMessage off mode no thread_ts uses channel_id as chat_id" {
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000001.000"}
@@ -1816,6 +1847,7 @@ test "processHistoryMessage all mode no thread_ts uses message_ts as thread" {
     ch.account_id = "sl-main";
     ch.reply_to_mode = .all;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000001.000"}
@@ -1840,6 +1872,7 @@ test "processHistoryMessage all mode with thread_ts uses thread_ts" {
     ch.reply_to_mode = .all;
     ch.setBus(&eb);
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000002.000","thread_ts":"1700000001.000"}
@@ -1864,6 +1897,7 @@ test "thread_policy open: thread reply without mention is handled" {
     ch.thread_policy = .open;
     ch.setBus(&eb);
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     // No mention in text, but it's a thread reply (thread_ts != ts)
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -1890,6 +1924,7 @@ test "thread_policy mention_only: thread reply without mention is dropped" {
     ch.policy.group = .mention_only;
     ch.thread_policy = .mention_only;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"follow up without mention","ts":"1700000002.000","thread_ts":"1700000001.000"}
@@ -1915,6 +1950,7 @@ test "thread_policy open: top-level message without mention is still dropped" {
     ch.policy.group = .mention_only;
     ch.thread_policy = .open;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     // Top-level message (no thread_ts) without mention — thread_policy should not apply
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -1933,6 +1969,7 @@ test "maybeGetThreadHistory returns null in tests (fetchThreadReplies is no-op)"
     const allowed = [_][]const u8{"*"};
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     // fetchThreadReplies returns null in tests, so maybeGetThreadHistory should too.
     const result = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
@@ -1947,6 +1984,7 @@ test "maybeGetThreadHistory skips already-seen threads" {
     const allowed = [_][]const u8{"*"};
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     // First call: registers the thread.
     _ = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
@@ -1964,6 +2002,7 @@ test "maybeGetThreadHistory respects thread_initial_history_limit zero" {
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     ch.thread_initial_history_limit = 0;
     defer ch.clearSeenThreadSessions();
+    defer ch.clearLastProcessedTs();
 
     const result = ch.maybeGetThreadHistory("C99", "1700000001.000", "1700000002.000");
     try std.testing.expect(result == null);
@@ -2015,6 +2054,7 @@ test "processHistoryMessage thread reply content unchanged when history limit is
     ch.account_id = "sl-main";
     ch.thread_initial_history_limit = 0;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hello","ts":"1700000002.000","thread_ts":"1700000001.000"}
