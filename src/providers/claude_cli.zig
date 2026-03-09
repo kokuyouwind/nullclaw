@@ -55,14 +55,7 @@ pub const ClaudeCliProvider = struct {
         const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
         const effective_model = if (model.len > 0) model else self.model;
 
-        // Combine system prompt with message if provided
-        const prompt = if (system_prompt) |sys|
-            try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ sys, message })
-        else
-            try allocator.dupe(u8, message);
-        defer allocator.free(prompt);
-
-        return runClaude(allocator, prompt, effective_model);
+        return runClaude(allocator, message, effective_model, system_prompt);
     }
 
     fn chatImpl(
@@ -75,9 +68,11 @@ pub const ClaudeCliProvider = struct {
         const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
         const effective_model = if (model.len > 0) model else self.model;
 
-        // Extract last user message as prompt
-        const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try runClaude(allocator, prompt, effective_model);
+        // Extract system prompt and build conversation prompt from message history
+        const system_prompt = extractSystemPrompt(request.messages);
+        const prompt = try buildConversationPrompt(allocator, request.messages);
+        defer allocator.free(prompt);
+        const content = try runClaude(allocator, prompt, effective_model, system_prompt);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
 
@@ -96,8 +91,9 @@ pub const ClaudeCliProvider = struct {
     fn deinitImpl(_: *anyopaque) void {}
 
     /// Run the claude CLI and parse stream-json output.
-    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
-        const argv = [_][]const u8{
+    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8, system_prompt: ?[]const u8) ![]const u8 {
+        // Build argv with optional --system-prompt
+        const base_args = [_][]const u8{
             CLI_NAME,
             "-p",
             prompt,
@@ -108,8 +104,15 @@ pub const ClaudeCliProvider = struct {
             "--verbose",
             "--dangerously-skip-permissions",
         };
+        const sys_args = [_][]const u8{ "--system-prompt", system_prompt orelse "" };
+        const argv = if (system_prompt != null)
+            base_args ++ sys_args
+        else
+            base_args ++ [_][]const u8{ "", "" }; // padding for type compat
+        const argv_len: usize = if (system_prompt != null) base_args.len + sys_args.len else base_args.len;
+        const effective_argv = argv[0..argv_len];
 
-        var child = std.process.Child.init(&argv, allocator);
+        var child = std.process.Child.init(effective_argv, allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
@@ -211,6 +214,54 @@ fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
         },
         else => return error.CliNotFound,
     }
+}
+
+/// Extract system prompt from the first message if it has system role.
+fn extractSystemPrompt(messages: []const ChatMessage) ?[]const u8 {
+    if (messages.len > 0 and messages[0].role == .system) {
+        return messages[0].content;
+    }
+    return null;
+}
+
+/// Build a conversation prompt from message history, including all non-system messages.
+/// Formats multi-turn history so the LLM understands the conversation context.
+fn buildConversationPrompt(allocator: std.mem.Allocator, messages: []const ChatMessage) ![]const u8 {
+    // Find the last user message for the single-message fast path
+    var last_user_idx: ?usize = null;
+    var non_system_count: usize = 0;
+    for (messages, 0..) |msg, i| {
+        if (msg.role == .system) continue;
+        non_system_count += 1;
+        if (msg.role == .user) last_user_idx = i;
+    }
+
+    // Fast path: single non-system message (or only one user message with no other context)
+    if (non_system_count <= 1) {
+        if (last_user_idx) |idx| {
+            return try allocator.dupe(u8, messages[idx].content);
+        }
+        return error.NoUserMessage;
+    }
+
+    // Multi-turn: format as labeled conversation
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    const w = result.writer(allocator);
+    for (messages) |msg| {
+        if (msg.role == .system) continue;
+        const label = switch (msg.role) {
+            .user => "Human",
+            .assistant => "Assistant",
+            .tool => "Tool",
+            else => continue,
+        };
+        try w.print("[{s}]\n{s}\n\n", .{ label, msg.content });
+    }
+    if (result.items.len == 0) {
+        result.deinit(allocator);
+        return error.NoUserMessage;
+    }
+    return result.toOwnedSlice(allocator) catch error.NoUserMessage;
 }
 
 /// Extract the content of the last user message from a message slice.
@@ -316,4 +367,55 @@ test "ClaudeCliProvider.init returns CliNotFound for missing binary" {
 
 test "ClaudeCliProvider default model is claude-opus-4-6" {
     try std.testing.expectEqualStrings("claude-opus-4-6", ClaudeCliProvider.DEFAULT_MODEL);
+}
+
+test "extractSystemPrompt returns system message content" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.system("You are Miku"),
+        ChatMessage.user("hello"),
+    };
+    const result = extractSystemPrompt(&msgs);
+    try std.testing.expectEqualStrings("You are Miku", result.?);
+}
+
+test "extractSystemPrompt returns null when no system message" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("hello"),
+    };
+    try std.testing.expect(extractSystemPrompt(&msgs) == null);
+}
+
+test "extractSystemPrompt returns null for empty messages" {
+    const msgs = [_]ChatMessage{};
+    try std.testing.expect(extractSystemPrompt(&msgs) == null);
+}
+
+test "buildConversationPrompt single user message" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.system("Be helpful"),
+        ChatMessage.user("hello"),
+    };
+    const result = try buildConversationPrompt(std.testing.allocator, &msgs);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "buildConversationPrompt multi-turn conversation" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.system("Be helpful"),
+        ChatMessage.user("hi"),
+        ChatMessage.assistant("hello"),
+        ChatMessage.user("how are you"),
+    };
+    const result = try buildConversationPrompt(std.testing.allocator, &msgs);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[Human]\nhi\n\n[Assistant]\nhello\n\n[Human]\nhow are you\n\n", result);
+}
+
+test "buildConversationPrompt no user message returns error" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.system("Be helpful"),
+    };
+    const result = buildConversationPrompt(std.testing.allocator, &msgs);
+    try std.testing.expectError(error.NoUserMessage, result);
 }
