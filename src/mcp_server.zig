@@ -19,6 +19,8 @@ pub fn run(allocator: Allocator, tool_list: []const tools_mod.Tool) !void {
     const stdin = std.fs.File.stdin();
     const stdout = std.fs.File.stdout();
 
+    log.info("MCP server started with {d} tools", .{tool_list.len});
+
     while (true) {
         const line = readLine(allocator, stdin) catch |err| switch (err) {
             error.EndOfStream => return,
@@ -190,7 +192,8 @@ fn handleToolsCall(
     else
         empty_obj;
 
-    // Execute the tool
+    // Execute the tool (log to stderr so it appears in container logs)
+    log.info("MCP tools/call: {s}", .{tool_name});
     const result = t.execute(allocator, args) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "Tool execution error: {s}", .{@errorName(err)});
         defer allocator.free(msg);

@@ -132,6 +132,9 @@ pub const ClaudeCliProvider = struct {
             try argv_list.append(allocator, "--mcp-config");
             try argv_list.append(allocator, MCP_CONFIG);
             try argv_list.append(allocator, "--strict-mcp-config");
+            // Restrict to only MCP tools — block Claude Code builtins (Bash, CronCreate, etc.)
+            try argv_list.append(allocator, "--allowedTools");
+            try argv_list.append(allocator, "mcp__nullclaw-tools__*");
         }
 
         var child = std.process.Child.init(argv_list.items, allocator);
