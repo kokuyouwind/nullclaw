@@ -179,6 +179,10 @@ pub fn main() !void {
         try yc.from_json.run(allocator, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "--mcp-server")) {
+        try runMcpServer(allocator);
+        return;
+    }
 
     const cmd = parseCommand(args[1]) orelse {
         std.debug.print("Unknown command: {s}\n\n", .{args[1]});
@@ -355,6 +359,54 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
         std.process.exit(1);
     };
+}
+
+// ── MCP Server ──────────────────────────────────────────────────
+
+fn runMcpServer(allocator: std.mem.Allocator) !void {
+    // Create cron tools for the MCP server
+    const tools = try createMcpServerTools(allocator);
+    defer yc.tools.deinitTools(allocator, tools);
+
+    try yc.mcp_server.run(allocator, tools);
+}
+
+/// Create the tool set exposed by the MCP server.
+/// Currently exposes cron management tools only.
+fn createMcpServerTools(allocator: std.mem.Allocator) ![]yc.tools.Tool {
+    var list: std.ArrayList(yc.tools.Tool) = .{};
+    errdefer {
+        for (list.items) |t| {
+            t.deinit(allocator);
+        }
+        list.deinit(allocator);
+    }
+
+    const ca = try allocator.create(yc.tools.cron_add.CronAddTool);
+    ca.* = .{};
+    try list.append(allocator, ca.tool());
+
+    const cl = try allocator.create(yc.tools.cron_list.CronListTool);
+    cl.* = .{};
+    try list.append(allocator, cl.tool());
+
+    const cr = try allocator.create(yc.tools.cron_remove.CronRemoveTool);
+    cr.* = .{};
+    try list.append(allocator, cr.tool());
+
+    const cu = try allocator.create(yc.tools.cron_update.CronUpdateTool);
+    cu.* = .{};
+    try list.append(allocator, cu.tool());
+
+    const crn = try allocator.create(yc.tools.cron_run.CronRunTool);
+    crn.* = .{};
+    try list.append(allocator, crn.tool());
+
+    const crs = try allocator.create(yc.tools.cron_runs.CronRunsTool);
+    crs.* = .{};
+    try list.append(allocator, crs.tool());
+
+    return list.toOwnedSlice(allocator);
 }
 
 // ── Cron ─────────────────────────────────────────────────────────

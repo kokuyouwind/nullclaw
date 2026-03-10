@@ -62,6 +62,7 @@ pub const runtime = @import("runtime.zig");
 
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
+pub const mcp_server = @import("mcp_server.zig");
 pub const subagent = @import("subagent.zig");
 pub const subagent_runner = @import("subagent_runner.zig");
 
