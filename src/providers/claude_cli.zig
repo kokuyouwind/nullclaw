@@ -13,17 +13,32 @@ const ChatMessage = root.ChatMessage;
 pub const ClaudeCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
+    mcp_enabled: bool,
 
     const DEFAULT_MODEL = "claude-opus-4-6";
     const CLI_NAME = "claude";
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
+    /// MCP config JSON that tells Claude Code to spawn nullclaw as an MCP server.
+    const MCP_CONFIG =
+        \\{"mcpServers":{"nullclaw-tools":{"command":"nullclaw","args":["--mcp-server"]}}}
+    ;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !ClaudeCliProvider {
         // Verify CLI is in PATH
         try checkCliAvailable(allocator, CLI_NAME);
+
+        // Check if MCP tools passthrough is enabled via environment
+        const platform = @import("../platform.zig");
+        const mcp_env = platform.getEnvOrNull(allocator, "NULLCLAW_MCP_TOOLS");
+        const mcp_on = if (mcp_env) |v| blk: {
+            defer allocator.free(v);
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        } else false;
+
         return .{
             .allocator = allocator,
             .model = model orelse DEFAULT_MODEL,
+            .mcp_enabled = mcp_on,
         };
     }
 
@@ -55,7 +70,7 @@ pub const ClaudeCliProvider = struct {
         const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
         const effective_model = if (model.len > 0) model else self.model;
 
-        return runClaude(allocator, message, effective_model, system_prompt);
+        return runClaude(allocator, message, effective_model, system_prompt, self.mcp_enabled);
     }
 
     fn chatImpl(
@@ -72,7 +87,7 @@ pub const ClaudeCliProvider = struct {
         const system_prompt = extractSystemPrompt(request.messages);
         const prompt = try buildConversationPrompt(allocator, request.messages);
         defer allocator.free(prompt);
-        const content = try runClaude(allocator, prompt, effective_model, system_prompt);
+        const content = try runClaude(allocator, prompt, effective_model, system_prompt, self.mcp_enabled);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
 
@@ -91,28 +106,35 @@ pub const ClaudeCliProvider = struct {
     fn deinitImpl(_: *anyopaque) void {}
 
     /// Run the claude CLI and parse stream-json output.
-    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8, system_prompt: ?[]const u8) ![]const u8 {
-        // Build argv with optional --system-prompt
-        const base_args = [_][]const u8{
-            CLI_NAME,
-            "-p",
-            prompt,
-            "--output-format",
-            "stream-json",
-            "--model",
-            model,
-            "--verbose",
-            "--dangerously-skip-permissions",
-        };
-        const sys_args = [_][]const u8{ "--system-prompt", system_prompt orelse "" };
-        const argv = if (system_prompt != null)
-            base_args ++ sys_args
-        else
-            base_args ++ [_][]const u8{ "", "" }; // padding for type compat
-        const argv_len: usize = if (system_prompt != null) base_args.len + sys_args.len else base_args.len;
-        const effective_argv = argv[0..argv_len];
+    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8, system_prompt: ?[]const u8, mcp_enabled: bool) ![]const u8 {
+        // Build argv dynamically with optional flags
+        var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv_list.deinit(allocator);
 
-        var child = std.process.Child.init(effective_argv, allocator);
+        // Base arguments
+        for ([_][]const u8{
+            CLI_NAME,        "-p",                 prompt,
+            "--output-format", "stream-json",
+            "--model",        model,
+            "--verbose",      "--dangerously-skip-permissions",
+        }) |arg| {
+            try argv_list.append(allocator, arg);
+        }
+
+        // Optional: system prompt
+        if (system_prompt) |sp| {
+            try argv_list.append(allocator, "--system-prompt");
+            try argv_list.append(allocator, sp);
+        }
+
+        // Optional: MCP server config (expose nullclaw tools to Claude Code)
+        if (mcp_enabled) {
+            try argv_list.append(allocator, "--mcp-config");
+            try argv_list.append(allocator, MCP_CONFIG);
+            try argv_list.append(allocator, "--strict-mcp-config");
+        }
+
+        var child = std.process.Child.init(argv_list.items, allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
