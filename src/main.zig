@@ -364,16 +364,30 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── MCP Server ──────────────────────────────────────────────────
 
 fn runMcpServer(allocator: std.mem.Allocator) !void {
-    // Create cron tools for the MCP server
-    const tools = try createMcpServerTools(allocator);
+    // Load config to extract channel credentials for MCP tools
+    var cfg = yc.config.Config.load(allocator) catch null;
+    defer if (cfg) |*c| c.deinit();
+
+    const slack_bot_token: ?[]const u8 = if (cfg) |c|
+        (if (c.channels.slack.len > 0) c.channels.slack[0].bot_token else null)
+    else
+        null;
+
+    const tools = try createMcpServerTools(allocator, .{
+        .slack_bot_token = slack_bot_token,
+    });
     defer yc.tools.deinitTools(allocator, tools);
 
     try yc.mcp_server.run(allocator, tools);
 }
 
+const McpToolsOptions = struct {
+    slack_bot_token: ?[]const u8 = null,
+};
+
 /// Create the tool set exposed by the MCP server.
-/// Currently exposes cron management tools only.
-fn createMcpServerTools(allocator: std.mem.Allocator) ![]yc.tools.Tool {
+/// Exposes cron management and Slack messaging tools.
+fn createMcpServerTools(allocator: std.mem.Allocator, opts: McpToolsOptions) ![]yc.tools.Tool {
     var list: std.ArrayList(yc.tools.Tool) = .{};
     errdefer {
         for (list.items) |t| {
@@ -405,6 +419,13 @@ fn createMcpServerTools(allocator: std.mem.Allocator) ![]yc.tools.Tool {
     const crs = try allocator.create(yc.tools.cron_runs.CronRunsTool);
     crs.* = .{};
     try list.append(allocator, crs.tool());
+
+    // Slack send tool (requires bot token from config)
+    if (opts.slack_bot_token) |token| {
+        const ss = try allocator.create(yc.tools.slack_send.SlackSendTool);
+        ss.* = .{ .bot_token = token };
+        try list.append(allocator, ss.tool());
+    }
 
     return list.toOwnedSlice(allocator);
 }
