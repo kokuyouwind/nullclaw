@@ -13,27 +13,73 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp_server);
 
+/// Module-level log file handle (opened once in run(), closed on exit).
+var log_file: ?std.fs.File = null;
+
+/// Write a log message to both stderr and the log file.
+fn logMsg(comptime fmt: []const u8, args: anytype) void {
+    // stderr (best-effort, may not be visible from grandchild process)
+    log.info(fmt, args);
+    // file log (best-effort)
+    writeToLogFile("INFO", fmt, args);
+}
+
+fn logErr(comptime fmt: []const u8, args: anytype) void {
+    log.err(fmt, args);
+    writeToLogFile("ERROR", fmt, args);
+}
+
+fn writeToLogFile(comptime level: []const u8, comptime fmt: []const u8, args: anytype) void {
+    const f = log_file orelse return;
+    var write_buf: [256]u8 = undefined;
+    var bw = f.writer(&write_buf);
+    bw.interface.print("[" ++ level ++ "] " ++ fmt ++ "\n", args) catch {};
+    bw.interface.flush() catch {};
+}
+
+/// Open (or create) the MCP server log file in append mode.
+fn openLogFile() ?std.fs.File {
+    // Use HOME env to locate ~/.nullclaw/logs/
+    const home: []const u8 = std.posix.getenv("HOME") orelse "/home/nullclaw";
+    var path_buf: [512]u8 = undefined;
+
+    // Ensure logs directory exists
+    const dir_path = std.fmt.bufPrint(&path_buf, "{s}/.nullclaw/logs", .{home}) catch return null;
+    std.fs.cwd().makePath(dir_path) catch {};
+
+    // Open/create log file in append mode
+    var file_buf: [512]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&file_buf, "{s}/.nullclaw/logs/mcp-server.log", .{home}) catch return null;
+    const file = std.fs.cwd().createFile(file_path, .{ .truncate = false }) catch return null;
+    file.seekFromEnd(0) catch {};
+    return file;
+}
+
 /// Run the MCP server loop on stdin/stdout.
 /// Blocks until stdin is closed or an unrecoverable error occurs.
 pub fn run(allocator: Allocator, tool_list: []const tools_mod.Tool) !void {
     const stdin = std.fs.File.stdin();
     const stdout = std.fs.File.stdout();
 
-    log.info("MCP server started with {d} tools", .{tool_list.len});
+    // Open log file for persistent logging (grandchild stderr is not visible)
+    log_file = openLogFile();
+    defer if (log_file) |f| f.close();
+
+    logMsg("MCP server started with {d} tools", .{tool_list.len});
 
     while (true) {
         const line = readLine(allocator, stdin) catch |err| switch (err) {
             error.EndOfStream => return,
             error.EmptyLine => continue,
             else => {
-                log.err("stdin read error: {}", .{err});
+                logErr("stdin read error: {}", .{err});
                 return err;
             },
         };
         defer allocator.free(line);
 
         handleMessage(allocator, stdout, line, tool_list) catch |err| {
-            log.err("failed to handle message: {}", .{err});
+            logErr("failed to handle message: {}", .{err});
         };
     }
 }
@@ -193,15 +239,21 @@ fn handleToolsCall(
         empty_obj;
 
     // Execute the tool (log to stderr so it appears in container logs)
-    log.info("MCP tools/call: {s}", .{tool_name});
-    const result = t.execute(allocator, args) catch |err| {
+    logMsg("MCP tools/call: {s}", .{tool_name});
+
+    // Use arena allocator for tool execution so that ToolResult's output/error_msg
+    // (which may be heap-allocated or string literals) are freed uniformly.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = t.execute(arena.allocator(), args) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "Tool execution error: {s}", .{@errorName(err)});
         defer allocator.free(msg);
         try writeErrorResponse(allocator, stdout, id, -32000, msg);
         return;
     };
 
-    // Build MCP tool result response
+    // Build MCP tool result response (using outer allocator; arena freed after write)
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
