@@ -364,15 +364,46 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── MCP Server ──────────────────────────────────────────────────
 
 fn runMcpServer(allocator: std.mem.Allocator) !void {
-    // Create cron tools for the MCP server
+    // Load config to extract workspace dir and memory settings
+    var cfg = yc.config.Config.load(allocator) catch null;
+    defer if (cfg) |*c| c.deinit();
+
+    const workspace_dir: []const u8 = if (cfg) |c| c.workspace_dir else "/workspace";
+
     const tools = try createMcpServerTools(allocator);
     defer yc.tools.deinitTools(allocator, tools);
 
+    // Initialize full MemoryRuntime (with vector plane and retrieval engine)
+    // via initRuntime() so that memory_recall gets hybrid search support.
+    if (cfg) |c| {
+        var mem_rt = yc.memory.initRuntime(allocator, &c.memory, workspace_dir);
+        defer if (mem_rt) |*rt| rt.deinit();
+
+        if (mem_rt) |*rt| {
+            yc.tools.bindMemoryTools(tools, rt.memory);
+            yc.tools.bindMemoryRuntime(tools, rt);
+            return yc.mcp_server.run(allocator, tools);
+        }
+    }
+
+    // Fallback: bare SQLite without vector plane
+    const db_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" }) catch {
+        // No memory at all — tools will report "backend not configured"
+        return yc.mcp_server.run(allocator, tools);
+    };
+    defer allocator.free(db_path);
+
+    var sqlite_mem = yc.memory.SqliteMemory.init(allocator, db_path) catch {
+        return yc.mcp_server.run(allocator, tools);
+    };
+    defer sqlite_mem.deinit();
+
+    yc.tools.bindMemoryTools(tools, sqlite_mem.memory());
     try yc.mcp_server.run(allocator, tools);
 }
 
 /// Create the tool set exposed by the MCP server.
-/// Currently exposes cron management tools only.
+/// Exposes cron management and memory tools.
 fn createMcpServerTools(allocator: std.mem.Allocator) ![]yc.tools.Tool {
     var list: std.ArrayList(yc.tools.Tool) = .{};
     errdefer {
@@ -405,6 +436,23 @@ fn createMcpServerTools(allocator: std.mem.Allocator) ![]yc.tools.Tool {
     const crs = try allocator.create(yc.tools.cron_runs.CronRunsTool);
     crs.* = .{};
     try list.append(allocator, crs.tool());
+
+    // Memory tools (backend bound later via bindMemoryTools)
+    const mst = try allocator.create(yc.tools.memory_store.MemoryStoreTool);
+    mst.* = .{};
+    try list.append(allocator, mst.tool());
+
+    const mrt = try allocator.create(yc.tools.memory_recall.MemoryRecallTool);
+    mrt.* = .{};
+    try list.append(allocator, mrt.tool());
+
+    const mlt = try allocator.create(yc.tools.memory_list.MemoryListTool);
+    mlt.* = .{};
+    try list.append(allocator, mlt.tool());
+
+    const mft = try allocator.create(yc.tools.memory_forget.MemoryForgetTool);
+    mft.* = .{};
+    try list.append(allocator, mft.tool());
 
     return list.toOwnedSlice(allocator);
 }
