@@ -29,6 +29,10 @@ pub const SlackChannel = struct {
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
+    /// Dedup: track recently processed message_ts to avoid handling both
+    /// `message` and `app_mention` events for the same Slack message.
+    last_processed_ts: ?[]const u8 = null,
+    last_processed_ts_owned: bool = false,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -432,6 +436,21 @@ pub const SlackChannel = struct {
     ) !void {
         if (msg_obj.get("subtype")) |sub_val| {
             if (sub_val == .string and sub_val.string.len > 0) return;
+        }
+
+        // Dedup: skip if we already processed this message_ts (e.g. both
+        // `message` and `app_mention` events fired for the same message).
+        if (msg_obj.get("ts")) |ts_val| {
+            if (ts_val == .string and ts_val.string.len > 0) {
+                if (self.last_processed_ts) |prev| {
+                    if (std.mem.eql(u8, prev, ts_val.string)) return;
+                }
+                if (self.last_processed_ts_owned) {
+                    if (self.last_processed_ts) |prev| self.allocator.free(prev);
+                }
+                self.last_processed_ts = self.allocator.dupe(u8, ts_val.string) catch null;
+                self.last_processed_ts_owned = self.last_processed_ts != null;
+            }
         }
 
         const user_val = msg_obj.get("user") orelse return;
@@ -1016,11 +1035,20 @@ pub const SlackChannel = struct {
             self.bot_api_app_id = null;
         }
         self.clearChannelCursors();
+        self.clearLastProcessedTs();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
             self.last_ts = "0";
             self.last_ts_owned = false;
         }
+    }
+
+    fn clearLastProcessedTs(self: *SlackChannel) void {
+        if (self.last_processed_ts_owned) {
+            if (self.last_processed_ts) |ts| self.allocator.free(ts);
+        }
+        self.last_processed_ts = null;
+        self.last_processed_ts_owned = false;
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -1596,6 +1624,7 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     var ch = SlackChannel.init(alloc, "tok", null, "C12345", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -1634,6 +1663,7 @@ test "processHistoryMessage off mode top-level post uses channel_id as chat_id" 
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
     // reply_to_mode defaults to .off
 
     // thread_ts == ts: top-level post that started a thread, not a reply
@@ -1658,6 +1688,7 @@ test "processHistoryMessage off mode no thread_ts uses channel_id as chat_id" {
     var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
     ch.account_id = "sl-main";
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000001.000"}
@@ -1681,6 +1712,7 @@ test "processHistoryMessage all mode no thread_ts uses message_ts as thread" {
     ch.account_id = "sl-main";
     ch.reply_to_mode = .all;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000001.000"}
@@ -1704,6 +1736,7 @@ test "processHistoryMessage all mode with thread_ts uses thread_ts" {
     ch.account_id = "sl-main";
     ch.reply_to_mode = .all;
     ch.setBus(&eb);
+    defer ch.clearLastProcessedTs();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"user":"U1","text":"hi","ts":"1700000002.000","thread_ts":"1700000001.000"}
