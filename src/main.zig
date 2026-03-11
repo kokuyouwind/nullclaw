@@ -364,7 +364,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── MCP Server ──────────────────────────────────────────────────
 
 fn runMcpServer(allocator: std.mem.Allocator) !void {
-    // Load config to extract channel credentials and workspace dir for MCP tools
+    // Load config to extract channel credentials, workspace dir, and memory settings
     var cfg = yc.config.Config.load(allocator) catch null;
     defer if (cfg) |*c| c.deinit();
 
@@ -375,33 +375,37 @@ fn runMcpServer(allocator: std.mem.Allocator) !void {
 
     const workspace_dir: []const u8 = if (cfg) |c| c.workspace_dir else "/workspace";
 
-    // Initialize SQLite memory backend for memory tools
-    const db_path = try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" });
-    defer allocator.free(db_path);
-
-    var sqlite_mem = yc.memory.SqliteMemory.init(allocator, db_path) catch |err| {
-        std.debug.print("MCP: SQLite memory init failed: {}\n", .{err});
-        // Continue without memory — tools will report "backend not configured"
-        return runMcpServerWithMemory(allocator, slack_bot_token, null);
-    };
-    defer sqlite_mem.deinit();
-
-    return runMcpServerWithMemory(allocator, slack_bot_token, sqlite_mem.memory());
-}
-
-fn runMcpServerWithMemory(
-    allocator: std.mem.Allocator,
-    slack_bot_token: ?[]const u8,
-    memory: ?yc.memory.Memory,
-) !void {
     const tools = try createMcpServerTools(allocator, .{
         .slack_bot_token = slack_bot_token,
     });
     defer yc.tools.deinitTools(allocator, tools);
 
-    // Bind memory backend to memory tools (no-op if memory is null)
-    yc.tools.bindMemoryTools(tools, memory);
+    // Initialize full MemoryRuntime (with vector plane and retrieval engine)
+    // via initRuntime() so that memory_recall gets hybrid search support.
+    if (cfg) |c| {
+        var mem_rt = yc.memory.initRuntime(allocator, &c.memory, workspace_dir);
+        defer if (mem_rt) |*rt| rt.deinit();
 
+        if (mem_rt) |*rt| {
+            yc.tools.bindMemoryTools(tools, rt.memory);
+            yc.tools.bindMemoryRuntime(tools, rt);
+            return yc.mcp_server.run(allocator, tools);
+        }
+    }
+
+    // Fallback: bare SQLite without vector plane
+    const db_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" }) catch {
+        // No memory at all — tools will report "backend not configured"
+        return yc.mcp_server.run(allocator, tools);
+    };
+    defer allocator.free(db_path);
+
+    var sqlite_mem = yc.memory.SqliteMemory.init(allocator, db_path) catch {
+        return yc.mcp_server.run(allocator, tools);
+    };
+    defer sqlite_mem.deinit();
+
+    yc.tools.bindMemoryTools(tools, sqlite_mem.memory());
     try yc.mcp_server.run(allocator, tools);
 }
 
